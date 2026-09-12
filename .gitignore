@@ -1,0 +1,7 @@
+node_modules/
+ecosystem.config.cjs
+.env
+.pm2/
+logs/
+*.log
+.DS_Store
