@@ -4,8 +4,13 @@ const generateReqId = AiBotPkg.generateReqId || (function() {
   return "req_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
 });
 
-const botId = "aibckhkgWRSDnXYpGoadBV7gnUJUmSNgg0o";
-const secret = "zUnKM8B5SQLjLN3C7vvZFFRvu7wZzvNnHawP7GZUSNg";
+const botId = process.env.WECOM_BOT_ID;
+const secret = process.env.WECOM_BOT_SECRET;
+
+if (!botId || !secret) {
+  console.error("[FATAL] Missing WECOM_BOT_ID / WECOM_BOT_SECRET");
+  process.exit(1);
+}
 
 // ── 共享记忆模块 ──
 const sharedMem = require("./shared-memory.cjs");
