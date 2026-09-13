@@ -1,18 +1,18 @@
 # grok-wecom-bot
 
-企业微信 Bot 桥接服务，通过 WebSocket 长连接接收消息，调用 Grok CLI (LongCat-2.0) 生成 AI 回复。
+企业微信 Bot 桥接服务，通过 WebSocket 长连接接收消息，调用 Grok CLI (grok) 生成 AI 回复。
 
 ## 架构
 
 ```
-企业微信用户 ──消息──→ 企业微信服务器 ──WebSocket──→ grok-wecom-bot ──CLI──→ Grok (LongCat-2.0)
+企业微信用户 ──消息──→ 企业微信服务器 ──WebSocket──→ grok-wecom-bot ──CLI──→ Grok (grok)
                                       ←──流式回复──                        ←──AI回复──
 ```
 
 ## 功能特性
 
 - WebSocket 长连接实时接收企业微信消息
-- 调用 Grok CLI (LongCat-2.0) 生成 AI 回复
+- 调用 Grok CLI (grok) 生成 AI 回复
 - 支持流式回复：先发送"正在思考…"，再发送最终回复
 - 自动重连：断线后 2 秒自动重连
 - 心跳保活：30 秒间隔维持连接
@@ -34,7 +34,7 @@ npm install
 | `WECOM_BOT_ID` | 企业微信 Bot ID | `aibckhkgWRSDnXYpGoadBV7gnUJUmSNgg0o` |
 | `WECOM_BOT_SECRET` | 企业微信 Bot 密钥 | `zUnKM8B5SQLjLN3C7vvZ...` |
 | `GROK_BIN` | Grok CLI 路径 | `/root/.local/bin/grok` |
-| `GROK_MODEL` | Grok 使用的模型 | `longcat` |
+| `GROK_MODEL` | Grok 使用的模型 | `grok` |
 | `LONGCAT_API_KEY` | LongCat API Key | `ak_2Kw8jv4Km5Sd3SO...` |
 | `NODE_ENV` | 运行环境 | `production` |
 
@@ -54,7 +54,7 @@ module.exports = {
       WECOM_BOT_ID: "your_bot_id",
       WECOM_BOT_SECRET: "your_bot_secret",
       GROK_BIN: "/path/to/grok",
-      GROK_MODEL: "longcat",
+      GROK_MODEL: "grok",
       LONGCAT_API_KEY: "your_api_key",
     }
   }]
