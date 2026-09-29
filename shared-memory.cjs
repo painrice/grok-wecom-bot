@@ -5,7 +5,8 @@
 // 
 // Provides:
 //   - appendConversation(agent, userId, role, message) — log to shared JSONL
-//   - getRecentContext(userId, maxTurns) — get last N turns for context injection
+//   - getRecentContext(userId, maxTurns, agent) — get last N turns for context injection
+//   - formatContextForPrompt(userId, maxTurns, agent, perMsg, assistantLabel) — build prompt context
 //   - getUserProfile(userId) — get cross-agent user profile
 //   - updateUserProfile(userId, data) — update profile
 // ═══════════════════════════════════════════════════════════════
@@ -62,12 +63,14 @@ function appendConversation(agent, userId, role, message) {
 }
 
 /**
- * Get recent conversation context for a user across all agents
+ * Get recent conversation context for a user
  * @param {string} userId - WeCom user ID
- * @param {number} maxTurns - Maximum number of turns to return (default 10)
+ * @param {number} maxTurns - Maximum number of entries to return (default 10)
+ * @param {string|null} agent - If provided, only return entries from this agent
+ *                              (avoids one bot reading another bot's history). null = all agents.
  * @returns {Array} Array of {ts, agent, role, message} objects
  */
-function getRecentContext(userId, maxTurns = 10) {
+function getRecentContext(userId, maxTurns = 10, agent = null) {
   ensureDir();
   if (!fs.existsSync(CONVERSATION_LOG)) return [];
   
@@ -79,7 +82,7 @@ function getRecentContext(userId, maxTurns = 10) {
   for (const line of lines) {
     try {
       const entry = JSON.parse(line);
-      if (entry.userId === userId) {
+      if (entry.userId === userId && (agent == null || entry.agent === agent)) {
         userLines.push(entry);
       }
     } catch { /* skip malformed */ }
@@ -92,20 +95,22 @@ function getRecentContext(userId, maxTurns = 10) {
 /**
  * Format recent context for injection into a model prompt
  * @param {string} userId 
- * @param {number} maxTurns 
- * @returns {string} Formatted context string
+ * @param {number} maxTurns - Max entries (default 6)
+ * @param {string|null} agent - Restrict to this agent's history (default null = all)
+ * @param {number} perMsg - Truncate each message to this many chars (default 300)
+ * @param {string} assistantLabel - How to label assistant turns (default '助手')
+ * @returns {string} Formatted context string (empty if no history)
  */
-function formatContextForPrompt(userId, maxTurns = 6) {
-  const entries = getRecentContext(userId, maxTurns);
+function formatContextForPrompt(userId, maxTurns = 6, agent = null, perMsg = 300, assistantLabel = '助手') {
+  const entries = getRecentContext(userId, maxTurns, agent);
   if (entries.length === 0) return '';
   
-  let ctx = '\n\n--- 历史对话上下文（来自所有Agent） ---\n';
+  let ctx = '【历史对话】\n';
   for (const e of entries) {
-    const who = e.role === 'user' ? '用户' : e.agent;
+    const who = e.role === 'user' ? '用户' : assistantLabel;
     const time = e.ts.slice(11, 16); // HH:MM
-    ctx += `[${time}] ${who}: ${e.message.substring(0, 300)}\n`;
+    ctx += `[${time}] ${who}: ${e.message.substring(0, perMsg)}\n`;
   }
-  ctx += '--- 历史结束 ---\n';
   return ctx;
 }
 
