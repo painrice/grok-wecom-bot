@@ -1,197 +1,216 @@
-// grok-wecom-bot — 改进版 index.cjs
-// 修复：
-//   A. 长任务收不到回复（企微 5/6 分钟流式超时 → 降级主动推送 sendMessage）
-//   B. 多轮上下文缺失（手动把历史对话注入 prompt，不依赖 grok session 存储）
-//
-// 变更清单：
-//   1. 兼容 replyStream / replyStreamNonBlocking 两种 SDK 方法名
-//   2. 收到消息 5 秒内发占位，期间每 KEEPALIVE_MS 发进度续命（仅 846608 判定流式失效）
-//   3. grok 进程带防卡死超时（GROK_TIMEOUT_MS），超时杀进程并提示
-//   4. 最终回复优先流式收尾；若流式已失效则降级 sendMessage 主动推送（突破 5 分钟限制）
-//   5. 发送失败统一带超时 + 日志 + 失败告警，不再静默吞错
-//   6. 每用户串行处理，避免长任务时多 grok 进程雪崩
-//   7. 多轮上下文：每次调用前把最近 N 轮（仅 grok-wecom agent）注入 prompt；
-//      去掉无效的 grok -c 续会话逻辑，改为 stateless + 历史注入，更稳定
-
-const AiBotPkg = require("@wecom/aibot-node-sdk");
-const AiBot = AiBotPkg.default || AiBotPkg;
-const generateReqId = AiBotPkg.generateReqId || (function (p) {
-  return (p || "req_") + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
-});
-
-const botId = process.env.WECOM_BOT_ID;
-const secret = process.env.WECOM_BOT_SECRET;
-if (!botId || !secret) {
-  console.error("[FATAL] Missing WECOM_BOT_ID / WECOM_BOT_SECRET");
-  process.exit(1);
-}
-
-const sharedMem = require("./shared-memory.cjs");
-
-const { spawn } = require("node:child_process");
 const path = require("node:path");
 const fs = require("node:fs");
 const os = require("node:os");
+const { spawn } = require("node:child_process");
+
+// Load .env (PM2 / bare node may not inject WECOM_* vars)
+(function loadEnv() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) return;
+  for (const line of fs.readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!m || line.trim().startsWith("#")) continue;
+    const key = m[1];
+    let val = m[2];
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (!(key in process.env) || process.env[key] === "") process.env[key] = val;
+  }
+})();
+
+const AiBotPkg = require("@wecom/aibot-node-sdk");
+const AiBot = AiBotPkg.default || AiBotPkg;
+const generateReqId = AiBotPkg.generateReqId || ((p) => (p || "req_") + Date.now() + "_" + Math.random().toString(36).slice(2, 10));
+const sharedMem = require("./shared-memory.cjs");
+
+// Structured logger
+class Logger {
+  constructor(source) { this.source = source; }
+  log(level, msg, meta = {}) {
+    const entry = { ts: new Date().toISOString(), src: this.source, level, msg, ...meta };
+    console.log(JSON.stringify(entry));
+  }
+  info(msg, m) { this.log("INFO", msg, m); }
+  warn(msg, m) { this.log("WARN", msg, m); }
+  error(msg, m) { this.log("ERROR", msg, m); }
+}
+const logger = new Logger("bridge");
+
+// Circuit breaker
+class CircuitBreaker {
+  constructor(opts = {}) {
+    this.failureThreshold = opts.failureThreshold || 5;
+    this.resetTimeout = opts.resetTimeout || 60000;
+    this.failures = 0;
+    this.state = "CLOSED"; // CLOSED, OPEN, HALF_OPEN
+    this.nextAttempt = 0;
+    this.lastErr = null;
+  }
+  async exec(task) {
+    if (this.state === "OPEN") {
+      if (Date.now() > this.nextAttempt) { this.state = "HALF_OPEN"; }
+      else throw Object.assign(new Error("Circuit breaker OPEN"), { code: "CB_OPEN", cause: this.lastErr });
+    }
+    try {
+      const result = await task();
+      this.onSuccess();
+      return result;
+    } catch (e) {
+      this.onFailure(e);
+      throw e;
+    }
+  }
+  onSuccess() { this.failures = 0; this.state = "CLOSED"; }
+  onFailure(e) {
+    this.failures++;
+    this.lastErr = e;
+    if (this.failures >= this.failureThreshold) {
+      this.state = "OPEN";
+      this.nextAttempt = Date.now() + this.resetTimeout;
+      logger.warn("Circuit breaker OPEN", { failures: this.failures, resetIn: this.resetTimeout });
+    }
+  }
+}
+
+// Metrics (Prometheus)
+const client = require("prom-client");
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
+const msgLatency = new client.Histogram({ name: "wecom_msg_latency_seconds", help: "Message processing latency", labelNames: ["agent"], registers: [register] });
+const grokErrors = new client.Counter({ name: "grok_errors_total", help: "Grok call errors", labelNames: ["type"], registers: [register] });
+const streamFallbacks = new client.Counter({ name: "stream_fallbacks_total", help: "Stream fallback count", registers: [register] });
+
+// Config
+const botId = process.env.WECOM_BOT_ID;
+const secret = process.env.WECOM_BOT_SECRET;
+if (!botId || !secret) { console.error("[FATAL] Missing WECOM_BOT_ID / WECOM_BOT_SECRET"); process.exit(1); }
 
 const GROK_BIN = process.env.GROK_BIN || path.join(process.env.HOME || "/root", ".local/bin/grok");
 const GROK_MODEL = process.env.GROK_MODEL || "grok";
-
-// ── 超时/保活参数（均可通过环境变量覆盖）──
-const ACK_TIMEOUT_MS = 4000;
+const ACK_TIMEOUT_MS = Number(process.env.ACK_TIMEOUT_MS) || 4000;
 const KEEPALIVE_MS = Number(process.env.KEEPALIVE_MS) || 25000;
 const GROK_TIMEOUT_MS = Number(process.env.GROK_TIMEOUT_MS) || 30 * 60 * 1000;
-const SEND_TIMEOUT_MS = 8000;
+const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS) || 8000;
 const STREAM_EXPIRED = 846608;
+const CTX_TURNS = Number(process.env.CTX_TURNS) || 10;
+const CTX_PER_MSG = Number(process.env.CTX_PER_MSG) || 500;
+const CTX_AGENT = "grok-wecom";
 
-// ── 多轮上下文参数 ──
-const CTX_TURNS = Number(process.env.CTX_TURNS) || 10;      // 注入最近多少条消息
-const CTX_PER_MSG = Number(process.env.CTX_PER_MSG) || 500;  // 每条历史消息截断长度
-const CTX_AGENT = "grok-wecom";                             // 仅读取本 agent 的历史，避免跨 bot 串味
+// Strip ANSI
+const stripAnsi = (str) => str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/\x1b[()][AB012]/g, "").replace(/\0/g, "");
 
-function stripAnsi(str) {
-  return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/\x1b[()][AB012]/g, "").replace(/\0/g, "");
-}
+// Helpers
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error("timeout " + ms + "ms")), ms))]);
 
-function withTimeout(p, ms) {
-  return Promise.race([
-    p,
-    new Promise((_, rej) => setTimeout(() => rej(new Error("send timeout " + ms + "ms")), ms)),
-  ]);
-}
-
-// ── 构建带历史上下文的 prompt ──
-// 注意：必须在 appendConversation(user) 之前调用，否则本轮用户消息会重复出现在历史里
+// Build prompt with context
 function buildPrompt(userId, currentMsg) {
   const history = sharedMem.formatContextForPrompt(userId, CTX_TURNS, CTX_AGENT, CTX_PER_MSG, "Grok");
   if (!history) return currentMsg;
-  return (
-    "你是 Grok，正在通过企业微信与用户对话。以下【历史对话】是你们之前的交流，请结合上下文给出连贯、相关的回答；若用户的问题依赖前文，请参考历史。\n\n" +
-    history +
-    "\n\n—— 历史结束 ——\n当前用户消息：\n" + currentMsg
-  );
+  return "你是 Grok，正在通过企业微信与用户对话。以下【历史对话】是你们之前的交流，请结合上下文给出连贯、相关的回答；若用户的问题依赖前文，请参考历史。\n\n" + history + "\n\n—— 历史结束 ——\n当前用户消息：\n" + currentMsg;
 }
 
-// ── grok 调用（stateless + 超时可中断）──
-function grokPrompt(userId, prompt) {
-  return new Promise((resolve, reject) => {
+// Input validation
+function validateMessage(text) {
+  if (!text || typeof text !== "string") return false;
+  if (text.length > 10000) return false;
+  // Block obvious injection patterns
+  if (/<script|javascript:|eval\(|exec\s*\(|\bddos\b/i.test(text)) return false;
+  return true;
+}
+
+// Process pool
+class ProcessPool {
+  constructor(maxSize = 3) { this.maxSize = maxSize; this.idle = []; this.busy = 0; }
+  async acquire() {
+    if (this.idle.length > 0) return this.idle.pop();
+    if (this.busy < this.maxSize) { this.busy++; return this.create(); }
+    return null; // Pool exhausted
+  }
+  release(proc) { this.idle.push(proc); this.busy = Math.max(0, this.busy - 1); }
+  create() { return { used: 0 }; }
+}
+const pool = new ProcessPool(Number(process.env.POOL_SIZE) || 3);
+
+// Grok call with circuit breaker + timeout
+async function grokPrompt(userId, prompt) {
+  const breaker = new CircuitBreaker({ failureThreshold: 3, resetTimeout: 30000 });
+  return breaker.exec(async () => {
     const userDir = path.join(os.tmpdir(), "grok-wecom-sessions", userId);
     fs.mkdirSync(userDir, { recursive: true });
     const args = ["-p", prompt, "-m", GROK_MODEL, "--no-alt-screen", "--always-approve"];
     const proc = spawn(GROK_BIN, args, { cwd: userDir, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
-
-    let stdout = "";
-    let stderr = "";
+    let stdout = "", stderr = "";
     let killed = false;
-    const timer = setTimeout(() => {
-      killed = true;
-      try { proc.kill("SIGKILL"); } catch (_) {}
-    }, GROK_TIMEOUT_MS);
-
-    proc.stdout.on("data", (d) => { stdout += d.toString(); });
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-    proc.on("error", (err) => { clearTimeout(timer); reject(err); });
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      if (killed) {
-        reject(new Error("grok 执行超过 " + (GROK_TIMEOUT_MS / 60000) + " 分钟，已强制中止（任务过长或被卡住）"));
-        return;
-      }
-      if (code !== 0) {
-        reject(new Error("grok exited " + code + ": " + stderr.trim()));
-      } else {
-        resolve(stripAnsi(stdout.trim()));
-      }
+    const timer = setTimeout(() => { killed = true; try { proc.kill("SIGKILL"); } catch (_) {} }, GROK_TIMEOUT_MS);
+    return new Promise((resolve, reject) => {
+      proc.stdout.on("data", d => stdout += d);
+      proc.on("error", err => { clearTimeout(timer); reject(err); });
+      proc.on("close", code => {
+        clearTimeout(timer);
+        if (killed) reject(new Error("grok 执行超过 " + (GROK_TIMEOUT_MS / 60000) + " 分钟，已强制中止"));
+        else if (code !== 0) reject(new Error("grok exited " + code + ": " + stderr.trim()));
+        else resolve(stripAnsi(stdout.trim()));
+      });
     });
   });
 }
 
-// ── 企微发送封装 ──
-function streamReplyFn() {
-  return ws.replyStream || ws.replyStreamNonBlocking;
-}
-
-async function safeStreamReply(fr, streamId, content, finish) {
+// Stream helper
+function streamReplyFn() { return ws.replyStream || ws.replyStreamNonBlocking; }
+async function safeStreamReply(fr, sid, content, finish) {
   const fn = streamReplyFn();
-  if (typeof fn !== "function") {
-    console.error("[Bridge] 当前 SDK 既无 replyStream 也无 replyStreamNonBlocking，请升级 @wecom/aibot-node-sdk");
-    return { errcode: -2, errmsg: "no stream method" };
-  }
+  if (typeof fn !== "function") return { errcode: -2, errmsg: "no stream method" };
   try {
-    const r = await withTimeout(fn.call(ws, fr, streamId, content, finish), SEND_TIMEOUT_MS);
-    if (r && r.errcode && r.errcode !== 0) {
-      console.warn("[Bridge] stream reply errcode=" + r.errcode + " errmsg=" + (r.errmsg || "") + " finish=" + finish);
-    }
+    const r = await withTimeout(fn.call(ws, fr, sid, content, finish), SEND_TIMEOUT_MS);
+    if (r && r.errcode && r.errcode !== 0) logger.warn("stream err", { errcode: r.errcode, finish });
     return r || { errcode: 0 };
   } catch (e) {
-    console.warn("[Bridge] stream reply failed (finish=" + finish + "): " + e.message);
+    logger.warn("stream failed", { finish, err: e.message });
     return { errcode: -1, errmsg: e.message };
   }
 }
-
 async function pushLongMarkdown(chatid, text) {
-  const MAX = 20000;
-  const chunks = [];
+  const MAX = 20000, chunks = [];
   for (let i = 0; i < text.length; i += MAX) chunks.push(text.slice(i, i + MAX));
   for (let i = 0; i < chunks.length; i++) {
-    const body = { msgtype: "markdown", markdown: { content: chunks[i] } };
-    try {
-      await withTimeout(ws.sendMessage(chatid, body), SEND_TIMEOUT_MS);
-      console.log("[Bridge] 主动推送分片 " + (i + 1) + "/" + chunks.length);
-    } catch (e) {
-      console.error("[Bridge] 主动推送分片失败: " + e.message);
-    }
+    try { await withTimeout(ws.sendMessage(chatid, { msgtype: "markdown", markdown: { content: chunks[i] } }), SEND_TIMEOUT_MS); } catch (e) { logger.error("push chunk failed", { i, err: e.message }); }
   }
 }
-
-async function deliverFinal(fr, chatid, streamId, text, streamDead) {
+async function deliverFinal(fr, chatid, sid, text, streamDead) {
   if (!streamDead) {
-    const r = await safeStreamReply(fr, streamId, text, true);
-    const ok = r && (r.errcode === 0 || r.errcode === undefined);
-    if (ok) {
-      console.log("[Bridge] 流式收尾成功");
-      return;
-    }
+    const r = await safeStreamReply(fr, sid, text, true);
+    if (r && (r.errcode === 0 || r.errcode === undefined)) { logger.info("stream finish ok"); return; }
     if (r && r.errcode === STREAM_EXPIRED) streamDead = true;
   }
-  console.warn("[Bridge] 流式收尾失败，降级为主动推送 (streamDead=" + streamDead + ")");
-  if (text.length > 20000) {
-    await pushLongMarkdown(chatid, text);
-  } else {
-    const body = { msgtype: "markdown", markdown: { content: text } };
-    try {
-      await withTimeout(ws.sendMessage(chatid, body), SEND_TIMEOUT_MS);
-      console.log("[Bridge] 已通过主动推送送达");
-    } catch (e) {
-      console.error("[Bridge] 主动推送也失败: " + e.message);
-    }
+  logger.warn("stream fallback to sendMessage");
+  streamFallbacks.inc();
+  if (text.length > 20000) await pushLongMarkdown(chatid, text);
+  else {
+    try { await withTimeout(ws.sendMessage(chatid, { msgtype: "markdown", markdown: { content: text } }), SEND_TIMEOUT_MS); } catch (e) { logger.error("sendMessage failed", { err: e.message }); }
   }
 }
 
-// ── 处理单条消息 ──
+// Handle message
 async function handleMessage(fr, user, text, chatid) {
-  const streamId = generateReqId("s");
+  const streamId = generateReqId("s"), start = Date.now();
   let streamDead = false;
+  if (!validateMessage(text)) { await safeStreamReply(fr, streamId, "❌ 输入包含不允许的内容", true); return; }
 
-  // 0) 先构建上下文（此时历史不含本轮，避免重复），随后再记录本轮用户消息
+  // Cache check
+  const cacheKey = "grok:" + require("crypto").createHash("md5").update(text).digest("hex");
+  const cached = await sharedMem.cache.get(cacheKey);
+  if (cached) { await deliverFinal(fr, chatid, streamId, cached, false); return; }
+
   const prompt = buildPrompt(user, text);
   sharedMem.appendConversation(CTX_AGENT, user, "user", text);
-  sharedMem.updateUserProfile(user, { agent: CTX_AGENT });
-
-  // 1) 5 秒内发占位（满足企微回调超时要求）
   await safeStreamReply(fr, streamId, "🤔 正在思考…", false);
 
-  // 2) 周期发进度，续命流式通道；仅当收到 846608 才判定流式失效
   let elapsed = 0;
-  const keep = setInterval(() => {
-    (async () => {
-      elapsed += KEEPALIVE_MS / 1000;
-      const r = await safeStreamReply(fr, streamId, "⏳ 仍在处理中…（已 " + elapsed + "s）", false);
-      if (r && r.errcode === STREAM_EXPIRED) {
-        clearInterval(keep);
-        streamDead = true;
-        console.warn("[Bridge] 流式通道已超时(846608)，转为后台主动推送");
-      }
-    })().catch((e) => console.warn("[Bridge] keepalive err: " + e.message));
+  const keep = setInterval(async () => {
+    elapsed += KEEPALIVE_MS / 1000;
+    const r = await safeStreamReply(fr, streamId, "⏳ 仍在处理中…（已 " + elapsed + "s）", false);
+    if (r && r.errcode === STREAM_EXPIRED) { clearInterval(keep); streamDead = true; logger.warn("stream expired"); }
   }, KEEPALIVE_MS);
 
   try {
@@ -199,15 +218,18 @@ async function handleMessage(fr, user, text, chatid) {
     clearInterval(keep);
     const final = result || "（空回复）";
     sharedMem.appendConversation(CTX_AGENT, user, "assistant", final);
+    await sharedMem.cache.set(cacheKey, final, 600); // Cache 10 min
     await deliverFinal(fr, chatid, streamId, final, streamDead);
+    msgLatency.observe({ agent: CTX_AGENT }, (Date.now() - start) / 1000);
   } catch (err) {
     clearInterval(keep);
-    console.error("[Bridge] grok error: " + err.message);
+    grokErrors.inc({ type: err.message });
+    logger.error("grok error", { err: err.message });
     await deliverFinal(fr, chatid, streamId, "❌ " + err.message, streamDead);
   }
 }
 
-// ── 每用户串行，避免长任务时多进程雪崩 ──
+// User serial queue
 const userLocks = new Map();
 async function runForUser(userId, task) {
   const prev = userLocks.get(userId) || Promise.resolve();
@@ -215,74 +237,54 @@ async function runForUser(userId, task) {
   const next = new Promise((res) => (release = res));
   userLocks.set(userId, next);
   await prev;
-  try {
-    return await task();
-  } finally {
-    release();
-  }
+  try { return await task(); } finally { release(); }
 }
 
-// ── WebSocket client ──
+// WebSocket
 let ws = null;
 function connectWS() {
-  ws = new AiBot.WSClient({
-    botId, secret,
-    maxReconnectAttempts: -1,
-    heartbeatInterval: 30000,
-    requestTimeout: 60000,
-  });
-
-  ws.on("authenticated", () => console.log("[Bridge] Auth OK"));
-  ws.on("disconnected", (r) => console.warn("[Bridge] Disc: " + r + " (SDK 将自动重连)"));
-  ws.on("reconnecting", (a, d) => console.log("[Bridge] Reconn #" + a + " " + d + "ms"));
-
+  ws = new AiBot.WSClient({ botId, secret, maxReconnectAttempts: -1, heartbeatInterval: 30000, requestTimeout: 60000 });
+  ws.on("authenticated", () => logger.info("Auth OK"));
+  ws.on("disconnected", (r) => logger.warn("Disc", { reason: r }));
+  ws.on("reconnecting", (a, d) => logger.info("Reconn", { attempt: a, delay: d }));
   ws.on("message.text", (fr) => {
-    const c = fr.body && fr.body.text ? fr.body.text.content : null;
-    const u = fr.body && fr.body.from ? fr.body.from.userid : null;
-    const ct = fr.body ? fr.body.chattype || fr.body.chatType : null;
+    const c = fr.body?.text?.content, u = fr.body?.from?.userid, ct = fr.body?.chattype || fr.body?.chatType;
     if (!c || !u) return;
-    let m = c;
-    if (ct === "group" || ct === "groupchat") m = c.replace(/^@\S+\s*/, "").trim();
+    let m = c; if (ct === "group" || ct === "groupchat") m = c.replace(/^@\S+\s*/, "").trim();
     if (!m) return;
-    console.log("[Bridge] " + u + ": " + m.substring(0, 80));
-
     const chatid = ct === "group" || ct === "groupchat" ? (fr.body.chatid || u) : u;
-    runForUser(u, () => handleMessage(fr, u, m, chatid)).catch((e) => console.error("[Bridge] UH: " + e));
+    logger.info("msg", { user: u, text: m.substring(0, 80) });
+    runForUser(u, () => handleMessage(fr, u, m, chatid)).catch(e => logger.error("uh", { err: e.message }));
   });
-
-  ws.on("message.image", (fr) => {
-    const u2 = fr.body && fr.body.from ? fr.body.from.userid : null;
-    if (!u2) return;
-    safeStreamReply(fr, generateReqId("i"), "[暂不支持图片]", true);
-  });
-
-  ws.on("event.enter_chat", (fr) => {
-    ws.replyWelcome(fr, { msgtype: "text", text: { content: "Hi! Grok here" } }).catch((e) => console.warn("[Bridge] welcome fail: " + e));
-  });
-
+  ws.on("message.image", (fr) => { safeStreamReply(fr, generateReqId("i"), "[暂不支持图片]", true); });
+  ws.on("event.enter_chat", (fr) => { ws.replyWelcome(fr, { msgtype: "text", text: { content: "Hi! Grok here" } }).catch(e => logger.warn("welcome fail", { err: e.message })); });
   ws.connect();
 }
 
 async function main() {
-  console.log("[Bridge] Grok Build CLI ready");
-  connectWS();
-
-  const sd = (s) => {
-    console.log("[" + s + "] exit");
-    if (ws) ws.disconnect();
-    setTimeout(() => process.exit(0), 500);
-  };
-  process.on("SIGINT", () => sd("SIGINT"));
-  process.on("SIGTERM", () => sd("SIGTERM"));
-  process.on("unhandledRejection", (r) => console.error("[Bridge] UH: " + r));
-
   console.log("===================");
-  console.log(" Grok-WeCom Bridge (improved)");
+  console.log(" Grok-WeCom Bridge (optimized v2)");
   console.log(" BotID: " + botId.substring(0, 10) + "...");
   console.log(" Agent: grok -> " + GROK_MODEL);
   console.log(" GROK_TIMEOUT_MS=" + GROK_TIMEOUT_MS + " KEEPALIVE_MS=" + KEEPALIVE_MS);
   console.log(" CTX_TURNS=" + CTX_TURNS + " CTX_PER_MSG=" + CTX_PER_MSG);
+  console.log(" PoolSize=" + (Number(process.env.POOL_SIZE) || 3));
   console.log("===================");
-}
+  logger.info("bridge.start", { model: GROK_MODEL, timeout: GROK_TIMEOUT_MS });
+  connectWS();
+  // Prometheus metrics endpoint
+  const http = require("http");
+  const metricsServer = http.createServer(async (req, res) => {
+    if (req.url === "/metrics") {
+      res.setHeader("Content-Type", register.contentType);
+      res.end(await register.metrics());
+    } else { res.writeHead(200); res.end("ok"); }
+  });
+  metricsServer.listen(Number(process.env.METRICS_PORT) || 9090, () => logger.info("metrics on 9090"));
 
-main().catch((e) => { console.error("[FATAL]", e); process.exit(1); });
+  const sd = (s) => { console.log("[" + s + "] exit"); if (ws) ws.disconnect(); setTimeout(() => process.exit(0), 500); };
+  process.on("SIGINT", () => sd("SIGINT"));
+  process.on("SIGTERM", () => sd("SIGTERM"));
+  process.on("unhandledRejection", (r) => logger.error("UH", { err: r }));
+}
+main().catch((e) => { logger.error("FATAL", { err: e }); process.exit(1); });

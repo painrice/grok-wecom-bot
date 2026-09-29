@@ -1,0 +1,30 @@
+# 复制为 ecosystem.config.cjs 后填入真实值；该文件已被 .gitignore 忽略。
+module.exports = {
+  apps: [
+    {
+      name: "grok-wecom",
+      script: "index.cjs",
+      cwd: "/path/to/grok-wecom-bot",
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "512M",
+      restart_delay: 3000,
+      max_restarts: 10,
+      env: {
+        WECOM_BOT_ID: "your_bot_id_here",
+        WECOM_BOT_SECRET: "your_bot_secret_here",
+        GROK_BIN: "/root/.local/bin/grok",
+        GROK_MODEL: "grok",
+        NODE_ENV: "production",
+        KEEPALIVE_MS: 25000,
+        GROK_TIMEOUT_MS: 1800000,
+        SEND_TIMEOUT_MS: 8000,
+        CTX_TURNS: 10,
+        CTX_PER_MSG: 500,
+        POOL_SIZE: 3,
+        METRICS_PORT: 9090,
+      },
+    },
+  ],
+};

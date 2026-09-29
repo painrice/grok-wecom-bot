@@ -1,15 +1,23 @@
 {
   "name": "grok-wecom-bot",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "version": "2.0.0",
+  "description": "Enterprise WeChat Bot bridge with Grok AI - Optimized",
+  "main": "index.cjs",
   "scripts": {
+    "start": "node index.cjs",
+    "dev": "node --watch index.cjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "keywords": ["wecom", "grok", "ai", "bot"],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@wecom/aibot-node-sdk": "^1.0.7"
+    "@wecom/aibot-node-sdk": "^1.0.7",
+    "better-sqlite3": "^9.4.3",
+    "prom-client": "^15.1.0",
+    "redis": "^4.6.10"
+  },
+  "optionalDependencies": {
+    "ioredis": "^5.3.2"
   }
 }
