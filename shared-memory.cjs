@@ -34,10 +34,19 @@ class SQLiteStore {
   }
   query(userId, maxTurns = 10, agentFilter = null) {
     if (!this.db) return [];
+    // 用自增 id 排序：ts 只有秒级精度，同秒内 user/assistant 顺序会颠倒
     const stmt = agentFilter
-      ? this.db.prepare('SELECT * FROM conversations WHERE userId = ? AND agent = ? ORDER BY ts DESC LIMIT ?')
-      : this.db.prepare('SELECT * FROM conversations WHERE userId = ? ORDER BY ts DESC LIMIT ?');
+      ? this.db.prepare('SELECT * FROM conversations WHERE userId = ? AND agent = ? ORDER BY id DESC LIMIT ?')
+      : this.db.prepare('SELECT * FROM conversations WHERE userId = ? ORDER BY id DESC LIMIT ?');
     return (agentFilter ? stmt.all(userId, agentFilter, maxTurns) : stmt.all(userId, maxTurns)).reverse();
+  }
+  count(userId, agent) {
+    if (!this.db) return 0;
+    return this.db.prepare('SELECT COUNT(*) AS c FROM conversations WHERE userId = ? AND agent = ?').get(userId, agent).c;
+  }
+  clear(userId, agent) {
+    if (!this.db) return;
+    this.db.prepare('DELETE FROM conversations WHERE userId = ? AND agent = ?').run(userId, agent);
   }
 }
 
@@ -91,6 +100,8 @@ const cache = new RedisCache();
 module.exports = {
   appendConversation: (agent, userId, role, msg) => { store.append(agent, userId, role, msg); },
   getRecentContext: (userId, maxTurns = 10, agent = null) => store.query(userId, maxTurns, agent),
+  countConversation: (userId, agent) => store.count(userId, agent),
+  clearConversation: (userId, agent) => { store.clear(userId, agent); },
   formatContextForPrompt: (userId, maxTurns = 6, agent = null, perMsg = 300) => {
     const entries = store.query(userId, maxTurns, agent);
     if (entries.length === 0) return '';

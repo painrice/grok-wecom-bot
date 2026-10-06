@@ -13,11 +13,21 @@
 
 - WebSocket 长连接实时接收企业微信消息
 - 调用 Grok CLI 生成 AI 回复
-- 流式进度推送：先发送「正在思考…」，超时保活，再发送最终回复
-- 断线自动重连、心跳保活
-- 多轮上下文（SQLite）、可选 Redis 缓存
+- **会话隔离**：私聊 `user:<userid>`、群聊 `group:<chatid>`，上下文/缓存/队列/工作目录互不串扰
+- **结果可靠送达**：进度走流式（思考中/心跳保活），最终结果 100% 走 `sendMessage` 独立送达；
+  流式进度检查全部 errcode，流 10 分钟过期后自动转入后台，每 3 分钟 sendMessage 汇报一次进度
+- **用户命令**：`/new` 清空会话上下文、`/status` 查看状态、`/help` 帮助
+- 多轮上下文（SQLite）、可选 Redis 缓存（缓存 key 含会话，防串答案）
 - Prometheus 指标端点（默认 `:9090/metrics`）
-- 熔断、用户级串行队列、长消息分片发送
+- 模块级熔断器（跨调用累积）、会话级串行队列、长消息自动分块
+
+## 用户命令
+
+| 命令 | 说明 |
+|------|------|
+| `/new` | 清空当前会话（私聊/群聊各自独立）的历史上下文 |
+| `/status` | 查看模型、上下文轮数、超时配置、运行时长 |
+| `/help` | 显示命令帮助 |
 
 ## 前置条件
 
@@ -64,7 +74,6 @@ cp ecosystem.config.cjs.example ecosystem.config.cjs
 | `SEND_TIMEOUT_MS` | 发送超时（ms） | `8000` |
 | `CTX_TURNS` | 上下文轮数 | `10` |
 | `CTX_PER_MSG` | 单条截断长度 | `500` |
-| `POOL_SIZE` | 进程池大小 | `3` |
 | `METRICS_PORT` | 指标端口 | `9090` |
 | `CONVERSATION_DB` | SQLite 路径（可选） | `/path/to/conversations.db` |
 | `REDIS_URL` | Redis 缓存（可选） | `redis://localhost:6379` |
